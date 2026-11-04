@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: nova-hosting-demo
+    runtime: python
+    buildCommand: echo 'No dependencies required'
+    startCommand: python server.py
