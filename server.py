@@ -3,10 +3,21 @@ from email.parser import BytesParser
 from email.policy import default
 import os,json,re,zipfile,io,shutil,mimetypes,urllib.parse,sqlite3,secrets,hmac,time,hashlib
 ROOT=os.path.dirname(os.path.abspath(__file__)); DATA=os.environ.get('NOVA_DATA_DIR',os.path.join(ROOT,'sites')); os.makedirs(DATA,exist_ok=True)
-DB=os.path.join(DATA,'nova.db'); sessions={}
+DB=os.path.join(DATA,'nova.db'); sessions={}; customer_sessions={}; login_attempts={}
 def db():
  c=sqlite3.connect(DB); c.execute('CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, name TEXT, phone TEXT, plan TEXT, note TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT "جديد")'); return c
-with db(): pass
+with db() as c:
+ c.execute('CREATE TABLE IF NOT EXISTS admin_settings (id INTEGER PRIMARY KEY CHECK(id=1), username TEXT NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL)')
+ c.execute('CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL)')
+ if 'customer_id' not in [x[1] for x in c.execute('PRAGMA table_info(orders)')]: c.execute('ALTER TABLE orders ADD COLUMN customer_id INTEGER')
+def pw_hash(password,salt): return hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),260000).hex()
+def admin_credentials():
+ with db() as c: row=c.execute('SELECT username,salt,password_hash FROM admin_settings WHERE id=1').fetchone()
+ return row
+def verify_admin(username,password):
+ row=admin_credentials()
+ if row: return hmac.compare_digest(username,row[0]) and hmac.compare_digest(pw_hash(password,row[1]),row[2])
+ return hmac.compare_digest(username,os.environ.get('ADMIN_USERNAME','nova')) and hmac.compare_digest(password,os.environ.get('ADMIN_PASSWORD','nova11'))
 class Handler(BaseHTTPRequestHandler):
  def send(self,code,body,ctype='application/json; charset=utf-8',headers=None):
   if not isinstance(body,(str,bytes)): body=json.dumps(body,ensure_ascii=False)
@@ -16,13 +27,27 @@ class Handler(BaseHTTPRequestHandler):
   self.end_headers();self.wfile.write(body)
  def auth(self):
   cookie=self.headers.get('Cookie',''); token=next((x.strip()[5:] for x in cookie.split(';') if x.strip().startswith('nova=')),''); exp=sessions.get(token,0); return bool(exp>time.time())
+ def customer(self):
+  cookie=self.headers.get('Cookie',''); token=next((x.strip()[9:] for x in cookie.split(';') if x.strip().startswith('customer=')),''); entry=customer_sessions.get(token)
+  return entry[0] if entry and entry[1]>time.time() else None
+ def limited(self):
+  key=self.client_address[0]; now=time.time(); attempts=[t for t in login_attempts.get(key,[]) if now-t<900]; login_attempts[key]=attempts
+  if len(attempts)>=20: return True
+  attempts.append(now); return False
  def readjson(self):
   n=int(self.headers.get('Content-Length','0'))
   if n>10000: raise ValueError('البيانات كبيرة جداً')
   return json.loads(self.rfile.read(n))
  def do_GET(self):
   p=urllib.parse.urlparse(self.path).path
-  if p in ('/','/admin'): return self.send(200,open(os.path.join(ROOT,'admin.html' if p=='/admin' else 'index.html'),'rb').read(),'text/html; charset=utf-8')
+  if p in ('/','/admin','/account'): return self.send(200,open(os.path.join(ROOT,{'/':'index.html','/admin':'admin.html','/account':'account.html'}[p]),'rb').read(),'text/html; charset=utf-8')
+  if p=='/api/my-orders':
+   uid=self.customer()
+   if not uid: return self.send(401,{'error':'سجّل دخولك أولاً'})
+   with db() as c:
+    user=c.execute('SELECT name,email FROM customers WHERE id=?',(uid,)).fetchone(); rows=c.execute('SELECT id,plan,created,status FROM orders WHERE customer_id=? ORDER BY id DESC',(uid,)).fetchall()
+   if not user: return self.send(401,{'error':'الحساب غير موجود'})
+   return self.send(200,{'name':user[0],'email':user[1],'orders':[dict(zip(('id','plan','created','status'),r)) for r in rows]})
   if p=='/api/orders':
    if not self.auth(): return self.send(401,{'error':'يرجى تسجيل الدخول'})
    with db() as c: rows=c.execute('SELECT id,name,phone,plan,note,created,status FROM orders ORDER BY id DESC LIMIT 500').fetchall()
@@ -37,17 +62,48 @@ class Handler(BaseHTTPRequestHandler):
   self.send(404,'Not found','text/plain')
  def do_POST(self):
   try:
+   if self.path in ('/api/register','/api/customer-login'):
+    if self.limited(): return self.send(429,{'error':'محاولات كثيرة، حاول لاحقاً'})
+    v=self.readjson(); email=str(v.get('email','')).strip().lower(); password=str(v.get('password','')); name=str(v.get('name','')).strip()[:100]
+    if len(email)>254 or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',email): raise ValueError('أدخل بريداً إلكترونياً صحيحاً')
+    if self.path=='/api/register':
+     if len(name)<2 or len(password)<12 or len(password)>128: raise ValueError('أدخل اسمك وكلمة مرور من 12 حرفاً على الأقل')
+     salt=secrets.token_hex(16)
+     try:
+      with db() as c: uid=c.execute('INSERT INTO customers(email,name,salt,password_hash) VALUES(?,?,?,?)',(email,name,salt,pw_hash(password,salt))).lastrowid
+     except sqlite3.IntegrityError: raise ValueError('البريد مسجل مسبقاً')
+    else:
+     with db() as c: row=c.execute('SELECT id,salt,password_hash FROM customers WHERE email=?',(email,)).fetchone()
+     if not row or not hmac.compare_digest(pw_hash(password,row[1]),row[2]): return self.send(401,{'error':'البريد أو كلمة المرور غير صحيح'})
+     uid=row[0]
+    token=secrets.token_urlsafe(32);customer_sessions[token]=(uid,time.time()+8*3600)
+    return self.send(200,{'ok':True},headers={'Set-Cookie':f'customer={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=28800'})
+   if self.path=='/api/customer-logout':
+    cookie=self.headers.get('Cookie',''); token=next((x.strip()[9:] for x in cookie.split(';') if x.strip().startswith('customer=')),'');customer_sessions.pop(token,None)
+    return self.send(200,{'ok':True},headers={'Set-Cookie':'customer=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'})
    if self.path=='/api/login':
-    v=self.readjson(); password=os.environ.get('ADMIN_PASSWORD',''); username=os.environ.get('ADMIN_USERNAME','admin')
-    if len(password)<12: return self.send(503,{'error':'اضبط ADMIN_PASSWORD في Railway على كلمة سر لا تقل عن 12 حرفاً.'})
-    if not hmac.compare_digest(str(v.get('username','')),username) or not hmac.compare_digest(str(v.get('password','')),password): return self.send(401,{'error':'اسم المستخدم أو كلمة المرور غير صحيح'})
+    if self.limited(): return self.send(429,{'error':'محاولات كثيرة، حاول لاحقاً'})
+    v=self.readjson(); username=str(v.get('username','')); password=str(v.get('password',''))
+    if not verify_admin(username,password): return self.send(401,{'error':'اسم المستخدم أو كلمة المرور غير صحيح'})
     token=secrets.token_urlsafe(32); sessions[token]=time.time()+8*3600
     return self.send(200,{'ok':True},headers={'Set-Cookie':f'nova={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=28800'})
-   if self.path=='/api/logout': return self.send(200,{'ok':True},headers={'Set-Cookie':'nova=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'})
+   if self.path=='/api/admin-password':
+    if not self.auth(): return self.send(401,{'error':'يرجى تسجيل الدخول'})
+    if self.limited(): return self.send(429,{'error':'محاولات كثيرة، حاول لاحقاً'})
+    v=self.readjson(); username=str(v.get('username','')); old=str(v.get('old','')); new=str(v.get('new',''))
+    if not verify_admin(username,old): return self.send(401,{'error':'اسم المستخدم أو كلمة المرور الحالية غير صحيح'})
+    if len(new)<12 or len(new)>128: raise ValueError('كلمة السر الجديدة يجب أن تكون بين 12 و128 حرفاً')
+    salt=secrets.token_hex(16)
+    with db() as c: c.execute('INSERT OR REPLACE INTO admin_settings(id,username,salt,password_hash) VALUES(1,?,?,?)',(username,salt,pw_hash(new,salt)))
+    sessions.clear()
+    return self.send(200,{'ok':True},headers={'Set-Cookie':'nova=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'})
+   if self.path=='/api/logout':
+    cookie=self.headers.get('Cookie',''); token=next((x.strip()[5:] for x in cookie.split(';') if x.strip().startswith('nova=')),''); sessions.pop(token,None)
+    return self.send(200,{'ok':True},headers={'Set-Cookie':'nova=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'})
    if self.path=='/api/order':
     v=self.readjson(); name=str(v.get('name','')).strip()[:100]; phone=str(v.get('phone','')).strip()[:50]; plan=str(v.get('plan','')).strip(); note=str(v.get('note','')).strip()[:1000]
     if len(name)<2 or len(phone)<5 or plan not in ('البداية','النمو','الأعمال'): raise ValueError('يرجى إكمال الاسم ورقم التواصل واختيار الباقة')
-    with db() as c: c.execute('INSERT INTO orders(name,phone,plan,note) VALUES(?,?,?,?)',(name,phone,plan,note))
+    with db() as c: c.execute('INSERT INTO orders(name,phone,plan,note,customer_id) VALUES(?,?,?,?,?)',(name,phone,plan,note,self.customer()))
     return self.send(200,{'ok':True})
    if self.path=='/api/status':
     if not self.auth(): return self.send(401,{'error':'يرجى تسجيل الدخول'})
